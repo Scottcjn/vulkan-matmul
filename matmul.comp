@@ -1,0 +1,51 @@
+#version 450
+
+// Tiled SGEMM: C[M,N] = A[M,K] * B[K,N]
+// Tile size 8x8 — exactly 1 RDNA1 wavefront (64 threads) per workgroup.
+// Single-wavefront workgroups avoid multi-wavefront barrier bugs in early RADV NAVI12.
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(std430, binding = 0) readonly buffer BufA { float a[]; };
+layout(std430, binding = 1) readonly buffer BufB { float b[]; };
+layout(std430, binding = 2) buffer        BufC { float c[]; };
+
+layout(push_constant) uniform Dims {
+    uint M;
+    uint N;
+    uint K;
+};
+
+shared float sA[8][8];
+shared float sB[8][8];
+
+void main() {
+    uint row = gl_WorkGroupID.y * 8u + gl_LocalInvocationID.y;
+    uint col = gl_WorkGroupID.x * 8u + gl_LocalInvocationID.x;
+    uint lx  = gl_LocalInvocationID.x;
+    uint ly  = gl_LocalInvocationID.y;
+
+    float acc = 0.0;
+    uint numTiles = (K + 7u) / 8u;
+
+    for (uint t = 0u; t < numTiles; t++) {
+        uint aCol = t * 8u + lx;
+        uint bRow = t * 8u + ly;
+
+        sA[ly][lx] = (row < M && aCol < K) ? a[row * K + aCol] : 0.0;
+        sB[ly][lx] = (bRow < K && col  < N) ? b[bRow * N + col] : 0.0;
+
+        memoryBarrierShared();  /* make writes visible before barrier */
+        barrier();              /* all threads done loading — safe to compute */
+
+        for (uint k = 0u; k < 8u; k++) {
+            acc = fma(sA[ly][k], sB[k][lx], acc);
+        }
+
+        barrier();  /* all threads done computing — safe to load next tile */
+    }
+
+    if (row < M && col < N) {
+        c[row * N + col] = acc;
+    }
+}
