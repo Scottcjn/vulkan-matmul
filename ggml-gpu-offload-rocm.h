@@ -35,6 +35,7 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <unistd.h>
+#include <pthread.h>
 
 #ifdef __cplusplus
 #include "ggml.h"
@@ -296,21 +297,54 @@ retry:;
     return 1;  /* handled by GPU */
 }
 
-/* ── Multi-thread wrapper ───────────────────────────────────────────────── */
-
+/* ── Barrier-based multi-thread guard ──────────────────────────────────── */
 /*
- * rocm_try_offload_mt():
- *   Safe wrapper that only fires on thread 0 in a single-thread context.
- *   With -t 1, params->nth == 1 and params->ith == 0 — offload fires.
- *   With -t N>1, falls through to CPU (multi-thread safe).
+ * rocm_try_offload_mt() — pthread_barrier rendezvous for any -t N.
+ *
+ * Identical design to the Vulkan version (ggml-gpu-offload-vulkan.h).
+ * Thread 0 does GPU work; all N threads rendezvous at a barrier; all
+ * return the same result.  Allows -t 64 for non-matmul ops on POWER8
+ * while still offloading matmuls to the ROCm server.
+ *
+ * Usage in ggml-cpu.c:
+ *   if (rocm_try_offload_mt(params, src0, src1, dst)) return;
  */
+
+static pthread_barrier_t _rocm_mt_bar;
+static volatile int      _rocm_mt_result = 0;
+static int               _rocm_bar_nth   = 0;
+static pthread_mutex_t   _rocm_bar_mu    = PTHREAD_MUTEX_INITIALIZER;
+
 static int rocm_try_offload_mt(const struct ggml_compute_params *params,
                                 const struct ggml_tensor         *src0,
                                 const struct ggml_tensor         *src1,
                                 struct ggml_tensor               *dst)
 {
-    if (params->ith != 0 || params->nth != 1) return 0;
-    return rocm_try_offload(src0, src1, dst);
+    /* Fast path: single-thread invocation */
+    if (params->nth == 1)
+        return (params->ith == 0) ? rocm_try_offload(src0, src1, dst) : 0;
+
+    /* Lazy barrier init — double-check locking */
+    if (_rocm_bar_nth != params->nth) {
+        pthread_mutex_lock(&_rocm_bar_mu);
+        if (_rocm_bar_nth != params->nth) {
+            if (_rocm_bar_nth > 0)
+                pthread_barrier_destroy(&_rocm_mt_bar);
+            pthread_barrier_init(&_rocm_mt_bar, NULL, (unsigned)params->nth);
+            _rocm_bar_nth = params->nth;
+        }
+        pthread_mutex_unlock(&_rocm_bar_mu);
+    }
+
+    /* Thread 0: do GPU work */
+    if (params->ith == 0)
+        _rocm_mt_result = rocm_try_offload(src0, src1, dst);
+
+    /* Rendezvous: wait for thread 0 */
+    pthread_barrier_wait(&_rocm_mt_bar);
+
+    /* All threads return thread 0's decision */
+    return _rocm_mt_result;
 }
 
 /* ── Shutdown stats ─────────────────────────────────────────────────────── */

@@ -58,6 +58,7 @@
 #include <arpa/inet.h>
 #include <unistd.h>
 #include <time.h>
+#include <pthread.h>
 
 #ifndef GGML_TYPE_F32
 #  include "ggml.h"
@@ -387,30 +388,74 @@ fail:
     return 0;
 }
 
+/* ─── Barrier-based multi-thread guard ──────────────────────────────────── */
 /*
- * vk_try_offload_mt():
- *   Multi-thread-safe wrapper.  ggml calls ggml_compute_forward_mul_mat from
- *   N worker threads simultaneously.  We do the GPU dispatch only from
- *   thread 0, and only when running single-threaded (nth==1), which avoids
- *   race conditions without requiring a mutex.
+ * vk_try_offload_mt() — pthread_barrier rendezvous for any -t N.
  *
- *   For multi-threaded use (nth>1) this returns 0 and falls through to CPU.
- *   To enable GPU offload in a multi-threaded run, pass -t 1 to llama-cli,
- *   or extend this function with a per-tensor completion flag.
+ * Problem the old design had:
+ *   The `nth == 1` guard required -t 1, sacrificing all POWER8 CPU
+ *   parallelism for non-matmul ops (RoPE, softmax, layer norm, RMSnorm).
+ *   With -t 64, those ops run 64-wide; with the old guard, they ran 1-wide.
  *
- *   Usage in ggml-cpu.c (inside ggml_compute_forward_mul_mat, before CPU path):
- *     if (vk_try_offload_mt(params, src0, src1, dst)) return;
+ * New design — barrier rendezvous:
+ *   • Thread 0    calls vk_try_offload() — does GPU work, writes dst->data
+ *   • Threads 1…N-1  skip GPU work
+ *   • ALL N threads call pthread_barrier_wait()
+ *   • Past the barrier: all threads read _vk_mt_result and return it
+ *
+ * If GPU offloaded (result=1): all threads return 1 → ggml skips CPU,
+ *                               dst->data already filled by thread 0.
+ * If GPU skipped   (result=0): all threads return 0 → ggml runs CPU
+ *                               and each thread handles its own slice normally.
+ *
+ * Memory ordering:
+ *   pthread_barrier_wait() is a full acquire/release fence.
+ *   Thread 0's write to _vk_mt_result (and to dst->data via GPU recv) is
+ *   visible to all threads after the barrier completes — no additional
+ *   mutex or atomic needed for the result read.
+ *
+ * nth is constant within a model run, so the barrier is initialised once.
+ *
+ * Usage in ggml-cpu.c (inside ggml_compute_forward_mul_mat, before CPU path):
+ *   if (vk_try_offload_mt(params, src0, src1, dst)) return;
  */
+
+static pthread_barrier_t _vk_mt_bar;
+static volatile int      _vk_mt_result = 0;   /* written by ith==0, read by all */
+static int               _vk_bar_nth   = 0;
+static pthread_mutex_t   _vk_bar_mu    = PTHREAD_MUTEX_INITIALIZER;
+
 static int vk_try_offload_mt(const struct ggml_compute_params *params,
                               const struct ggml_tensor         *src0,
                               const struct ggml_tensor         *src1,
                               struct ggml_tensor               *dst)
 {
-    /* Only thread 0 in a single-threaded context may offload.
-     * Multi-threaded matmul (nth>1) falls through to CPU.
-     * Use -t 1 with llama-cli to enable GPU offload. */
-    if (params->ith != 0 || params->nth != 1) return 0;
-    return vk_try_offload(src0, src1, dst);
+    /* ── Fast path: single-thread invocation ────────────────────────── */
+    if (params->nth == 1)
+        return (params->ith == 0) ? vk_try_offload(src0, src1, dst) : 0;
+
+    /* ── Lazy barrier init (nth is constant per model run) ──────────── *
+     * Double-check locking: read outside lock for speed, validate inside. */
+    if (_vk_bar_nth != params->nth) {
+        pthread_mutex_lock(&_vk_bar_mu);
+        if (_vk_bar_nth != params->nth) {
+            if (_vk_bar_nth > 0)
+                pthread_barrier_destroy(&_vk_mt_bar);
+            pthread_barrier_init(&_vk_mt_bar, NULL, (unsigned)params->nth);
+            _vk_bar_nth = params->nth;
+        }
+        pthread_mutex_unlock(&_vk_bar_mu);
+    }
+
+    /* ── Thread 0: do the GPU work ──────────────────────────────────── */
+    if (params->ith == 0)
+        _vk_mt_result = vk_try_offload(src0, src1, dst);
+
+    /* ── Rendezvous: wait for thread 0 to complete GPU work ─────────── */
+    pthread_barrier_wait(&_vk_mt_bar);
+
+    /* ── All threads: return thread 0's decision ────────────────────── */
+    return _vk_mt_result;
 }
 
 /* Print stats on shutdown */
