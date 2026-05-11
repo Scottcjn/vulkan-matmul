@@ -27,7 +27,14 @@ TYPE_PLAIN    = 0
 TYPE_CACHED   = 1
 
 HOST = "127.0.0.1"
-PORT = int(sys.argv[1]) if len(sys.argv) > 1 else 8097
+
+def _parse_port(argv):
+    try:
+        return int(argv[1]) if len(argv) > 1 else 8097
+    except (TypeError, ValueError):
+        return 8097
+
+PORT = _parse_port(sys.argv)
 
 # ─── Persistent connection ────────────────────────────────────────────────────
 
