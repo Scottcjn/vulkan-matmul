@@ -64,4 +64,4 @@ env GGML_GPU_OFFLOAD_ROCM=1 \
 
 ## License
 
-See [LICENSE](LICENSE).
+See the [contribution guide](CONTRIBUTING.md#license) for contribution licensing terms.
