@@ -412,7 +412,17 @@ static void handle_client(int fd) {
                 goto disconnect;
             }
 
-            uint8_t* b_stage = h_stage + szA;  /* use second half of staging */
+            /* A and B share one staging buffer, so bounding each of them
+             * separately is not enough: what must fit is the sum. The comment
+             * below used to say "second half", but only stage_max bytes are
+             * allocated in total, so a client sending szA = src_bytes = 256 MB
+             * wrote 256 MB of its own bytes past the end of the allocation. */
+            if (src_bytes > stage_max - szA) {
+                fprintf(stderr, "[server] A+B too large (%zu + %zu > %zu)\n",
+                        szA, src_bytes, stage_max);
+                goto disconnect;
+            }
+            uint8_t* b_stage = h_stage + szA;
             if (!recv_all(fd, b_stage, src_bytes)) goto disconnect;
 
             auto ts = std::chrono::steady_clock::now();
